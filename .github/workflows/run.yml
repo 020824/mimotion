@@ -5,6 +5,10 @@ on:
     - cron: '24 2,10,14 * * *'
   workflow_dispatch:
 
+# Use Beijing time inside the runner; schedule hours remain UTC.
+env:
+  TZ: Asia/Shanghai
+
 jobs:
   build:
     runs-on: ubuntu-latest
