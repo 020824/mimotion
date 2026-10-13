@@ -21,16 +21,11 @@ def get_int_value_default(_config: dict, _key, default):
     return int(_config.get(_key))
 
 
-# 获取当前时间对应的最大和最小步数
-def get_min_max_by_time(hour=None, minute=None):
-    if hour is None:
-        hour = time_bj.hour
-    if minute is None:
-        minute = time_bj.minute
-    time_rate = min((hour * 60 + minute) / (22 * 60), 1)
-    min_step = get_int_value_default(config, 'MIN_STEP', 18000)
-    max_step = get_int_value_default(config, 'MAX_STEP', 25000)
-    return int(time_rate * min_step), int(time_rate * max_step)
+# 每次成功上传都超过8000步，不依赖晚间任务是否准时触发。
+def get_min_max_steps():
+    min_step = max(get_int_value_default(config, 'MIN_STEP', 8001), 8001)
+    max_step = max(get_int_value_default(config, 'MAX_STEP', 10000), min_step)
+    return min_step, max_step
 
 
 # 虚拟ip地址
@@ -281,9 +276,10 @@ def execute():
         summary = f"\n执行账号总数{total}，成功：{success_count}，失败：{total - success_count}"
         print(summary)
         push_to_push_plus(push_results, summary)
+        return success_count == total
     else:
         print(f"账号数长度[{len(user_list)}]和密码数长度[{len(passwd_list)}]不匹配，跳过执行")
-        exit(1)
+        return False
 
 
 def prepare_user_tokens() -> dict:
@@ -349,7 +345,7 @@ if __name__ == "__main__":
         if users is None or passwords is None:
             print("未正确配置账号密码，无法执行")
             exit(1)
-        min_step, max_step = get_min_max_by_time()
+        min_step, max_step = get_min_max_steps()
         use_concurrent = config.get('USE_CONCURRENT')
         if use_concurrent is not None and use_concurrent == 'True':
             use_concurrent = True
@@ -357,4 +353,4 @@ if __name__ == "__main__":
             print(f"多账号执行间隔：{sleep_seconds}")
             use_concurrent = False
         # endregion
-        execute()
+        raise SystemExit(0 if execute() else 1)

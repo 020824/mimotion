@@ -7,9 +7,8 @@ import uuid
 from datetime import datetime
 
 import pytz
-import requests
-
 from util.aes_help import encrypt_data, HM_AES_KEY, HM_AES_IV
+from util.http_help import request_with_retry
 
 
 # 通过账号密码获取access_token和refresh_token 但是refresh_token不知道怎么使用
@@ -39,7 +38,7 @@ def login_access_token(user, password) -> (str | None, str | None):
     cipher_data = encrypt_data(plaintext, HM_AES_KEY, HM_AES_IV)
 
     url1 = 'https://api-user.zepp.com/v2/registrations/tokens'
-    r1 = requests.post(url1, data=cipher_data, headers=headers, allow_redirects=False, timeout=5)
+    r1 = request_with_retry('POST', url1, data=cipher_data, headers=headers, allow_redirects=False)
     if r1.status_code != 303:
         return None, "登录异常，status: %d" % r1.status_code
     try:
@@ -127,7 +126,10 @@ def grant_login_tokens(access_token, device_id, is_phone=False) -> (str | None, 
             "source": "com.xiaomi.hm.health:6.14.0:50818",
             "third_name": "email",
         }
-    resp = requests.post(url, data=data, headers=headers).json()
+    response = request_with_retry('POST', url, data=data, headers=headers)
+    if response.status_code != 200:
+        return None, None, None, "客户端登录请求异常：%d" % response.status_code
+    resp = response.json()
     # print("请求客户端登录成功：%s" % json.dumps(resp, ensure_ascii=False, indent=2))  #
     _login_token, _userid, _app_token = None, None, None
     try:
@@ -138,7 +140,7 @@ def grant_login_tokens(access_token, device_id, is_phone=False) -> (str | None, 
         _app_token = resp["token_info"]["app_token"]
         _userid = resp["token_info"]["user_id"]
     except:
-        print("提取login_token失败：%s" % json.dumps(resp, ensure_ascii=False, indent=2))
+        return None, None, None, "客户端登录返回的数据缺少有效token"
     return _login_token, _app_token, _userid, None
 
 
@@ -146,11 +148,10 @@ def grant_login_tokens(access_token, device_id, is_phone=False) -> (str | None, 
 def grant_app_token(login_token: str) -> (str | None, str | None):
     url = f"https://account-cn.huami.com/v1/client/app_tokens?app_name=com.xiaomi.hm.health&dn=api-user.huami.com%2Capi-mifit.huami.com%2Capp-analytics.huami.com&login_token={login_token}"
     headers = {'User-Agent': 'MiFit/5.3.0 (iPhone; iOS 14.7.1; Scale/3.00)'}
-    resp = requests.get(url, headers=headers)
+    resp = request_with_retry('GET', url, headers=headers)
     if resp.status_code != 200:
         return None, "请求异常：%d" % resp.status_code
     resp = resp.json()
-    print("grant_app_token: %s" % json.dumps(resp))
 
     result = resp.get("result")
     if result != "ok":
@@ -195,7 +196,7 @@ def check_app_token(app_token) -> (bool, str | None):
         "lang": "zh_CN",
         "clientid": "428135909242707968"
     }
-    response = requests.get(url, params=params, headers=headers)
+    response = request_with_retry('GET', url, params=params, headers=headers)
     if response.status_code != 200:
         return False, "请求异常：%d" % response.status_code
     response = response.json()
@@ -228,7 +229,7 @@ def renew_login_token(login_token) -> (str | None, str | None):
         "appplatform": "android_phone"
     }
 
-    resp = requests.get(url, params=params, headers=headers)
+    resp = request_with_retry('GET', url, params=params, headers=headers)
     if resp.status_code != 200:
         return None, "请求异常：%d" % resp.status_code
     resp = resp.json()
@@ -260,7 +261,7 @@ def post_fake_brand_data(step, app_token, userid):
 
     data = f'userid={userid}&last_sync_data_time=1597306380&device_type=0&last_deviceid=DA932FFFFE8816E7&data_json={data_json}'
 
-    response = requests.post(url, data=data, headers=head)
+    response = request_with_retry('POST', url, data=data, headers=head)
     if response.status_code != 200:
         return False, "请求修改步数异常：%d" % response.status_code
     response = response.json()

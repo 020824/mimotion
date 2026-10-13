@@ -2,44 +2,55 @@ name: 刷步数
 
 on:
   schedule:
-    - cron: '39 2,6,10,14 * * *'
+    # UTC 01/03/05/07/09/11:17 = 北京时间 09/11/13/15/17/19:17。
+    - cron: '17 1,3,5,7,9,11 * * *'
   workflow_dispatch:
 
-# Use Beijing time inside the runner; schedule hours remain UTC.
+permissions:
+  contents: write
+
+concurrency:
+  group: mimotion-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   TZ: Asia/Shanghai
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - name: Checkout codes
         uses: actions/checkout@v5
-        with:
-          token: ${{ secrets.PAT }} #此处PAT需要申请，教程详见：README
-      - name: Update system and install zsh
-        run: |
-          sudo -E apt-get -qq update
-          sudo -E apt-get install zsh -y
-          
+
       - name: 初始化Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.10"
-          
+
       - name: 开始
+        id: run
         env:
-            CONFIG: ${{ secrets.CONFIG }}
-            AES_KEY: ${{ secrets.AES_KEY }}
+          CONFIG: ${{ secrets.CONFIG }}
+          AES_KEY: ${{ secrets.AES_KEY }}
         run: |
-          pip3 install requests pytz pycryptodome
-          python3 main.py
+          python -m pip install requests pytz pycryptodome
+          python main.py
 
       - name: persist tokens
+        if: always() && steps.run.outcome != 'skipped'
         run: |
+          if [ ! -f encrypted_tokens.data ]; then
+            exit 0
+          fi
           git config user.name github-actions
           git config user.email github-actions@users.noreply.github.com
-          git add .
+          git add -- encrypted_tokens.data
+          if git diff --cached --quiet; then
+            echo "No token changes to persist"
+            exit 0
+          fi
           git commit -m "persist tokens trigger by ${{ github.event_name }}"
-          git push origin master
+          git pull --rebase origin master
+          git push origin HEAD:master
