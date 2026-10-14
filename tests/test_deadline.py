@@ -4,13 +4,15 @@ import os
 from pathlib import Path
 import runpy
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from datetime import datetime
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 import requests
 import main
 from util.http_help import request_with_retry
+from util.daily_success import DailySuccess
 
 
 class StepTargetTests(unittest.TestCase):
@@ -76,14 +78,26 @@ class RequestRetryTests(unittest.TestCase):
 
 
 class ScriptResultTests(unittest.TestCase):
-    def run_script(self, upload_result=(True, 'success'), login_result=('test-access', None), accounts=1):
+    def run_script(self, upload_result=(True, 'success'), login_result=('test-access', None), accounts=1, state_dir=None, date='2026-10-14', concurrent=False, user_list=None):
         config = {
-            'USER': '#'.join(['test@example.test'] * accounts),
+            'USER': '#'.join(user_list or [f'test{i}@example.test' for i in range(accounts)]),
             'PWD': '#'.join(['test-password'] * accounts),
             'MIN_STEP': '8000', 'MAX_STEP': '10000', 'SLEEP_GAP': '0',
+            'USE_CONCURRENT': 'True' if concurrent else 'False',
         }
         output = io.StringIO()
-        with patch.dict(os.environ, {'CONFIG': json.dumps(config), 'AES_KEY': ''}, clear=True), patch('util.zepp_helper.login_access_token', return_value=login_result), patch('util.zepp_helper.grant_login_tokens', return_value=('test-login', 'test-app', 'test-user', None)), patch('util.zepp_helper.check_app_token', return_value=(True, None)), patch('util.zepp_helper.post_fake_brand_data', side_effect=upload_result if isinstance(upload_result, list) else None, return_value=upload_result) as upload, redirect_stdout(output):
+        with ExitStack() as stack:
+            if state_dir is None:
+                state_dir = stack.enter_context(TemporaryDirectory())
+            stack.enter_context(patch.dict(os.environ, {'CONFIG': json.dumps(config), 'AES_KEY': ''}, clear=True))
+            stack.enter_context(patch('util.daily_success.DailySuccess', side_effect=lambda day: DailySuccess(day, Path(state_dir) / 'daily_success.json')))
+            clock = stack.enter_context(patch('datetime.datetime', wraps=datetime))
+            clock.now.return_value = datetime.fromisoformat(date + 'T15:17:00+08:00')
+            stack.enter_context(patch('util.zepp_helper.login_access_token', return_value=login_result))
+            stack.enter_context(patch('util.zepp_helper.grant_login_tokens', return_value=('test-login', 'test-app', 'test-user', None)))
+            stack.enter_context(patch('util.zepp_helper.check_app_token', return_value=(True, None)))
+            upload = stack.enter_context(patch('util.zepp_helper.post_fake_brand_data', side_effect=upload_result if isinstance(upload_result, list) else None, return_value=upload_result))
+            stack.enter_context(redirect_stdout(output))
             with self.assertRaises(SystemExit) as exit_result:
                 runpy.run_path(str(Path(main.__file__)), run_name='__main__')
         return exit_result.exception.code, upload, output.getvalue()
@@ -105,6 +119,72 @@ class ScriptResultTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(upload.call_count, 2)
         self.assertIn('成功：1，失败：1', output)
+
+    def test_later_run_skips_after_daily_success(self):
+        with TemporaryDirectory() as state_dir:
+            first, first_upload, _ = self.run_script(state_dir=state_dir)
+            second, second_upload, output = self.run_script(state_dir=state_dir)
+            self.assertEqual((first, second), (0, 0))
+            first_upload.assert_called_once()
+            second_upload.assert_not_called()
+            self.assertIn('跳过登录和步数修改', output)
+
+    def test_failed_first_run_is_retried_then_stops(self):
+        with TemporaryDirectory() as state_dir:
+            failed, first_upload, _ = self.run_script(upload_result=(False, 'rejected'), state_dir=state_dir)
+            recovered, second_upload, _ = self.run_script(state_dir=state_dir)
+            skipped, third_upload, _ = self.run_script(state_dir=state_dir)
+            self.assertEqual((failed, recovered, skipped), (1, 0, 0))
+            first_upload.assert_called_once()
+            second_upload.assert_called_once()
+            third_upload.assert_not_called()
+
+    def test_partial_failure_retries_only_failed_account(self):
+        with TemporaryDirectory() as state_dir:
+            first, first_upload, _ = self.run_script(upload_result=[(True, 'success'), (False, 'rejected')], accounts=2, state_dir=state_dir)
+            second, second_upload, output = self.run_script(accounts=2, state_dir=state_dir)
+            self.assertEqual((first, second), (1, 0))
+            self.assertEqual(first_upload.call_count, 2)
+            second_upload.assert_called_once()
+            self.assertIn('跳过重复修改', output)
+
+    def test_next_beijing_day_runs_again(self):
+        with TemporaryDirectory() as state_dir:
+            self.run_script(state_dir=state_dir, date='2026-10-14')
+            code, upload, _ = self.run_script(state_dir=state_dir, date='2026-10-15')
+            self.assertEqual(code, 0)
+            upload.assert_called_once()
+
+    def test_duplicate_concurrent_account_uploads_only_once(self):
+        with TemporaryDirectory() as state_dir:
+            code, upload, _ = self.run_script(accounts=2, state_dir=state_dir, concurrent=True, user_list=['same@example.test'] * 2)
+            self.assertEqual(code, 0)
+            upload.assert_called_once()
+
+    def test_existing_success_checkpoint_skips_today(self):
+        with TemporaryDirectory() as state_dir:
+            Path(state_dir, 'daily_success.json').write_text(json.dumps({'date': '2026-10-14', 'completed': True, 'accounts': {}}))
+            code, upload, _ = self.run_script(state_dir=state_dir)
+            self.assertEqual(code, 0)
+            upload.assert_not_called()
+
+
+class DailyRecordTests(unittest.TestCase):
+    def test_phone_prefixes_share_record_without_exposing_account(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory, 'daily_success.json')
+            state = DailySuccess('2026-10-14', path)
+            state.record('13800138000', 9000)
+            reloaded = DailySuccess('2026-10-14', path)
+            self.assertEqual(reloaded.get_step('+8613800138000'), 9000)
+            self.assertNotIn('13800138000', path.read_text())
+
+    def test_malformed_record_stops_instead_of_reuploading(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory, 'daily_success.json')
+            path.write_text('{}')
+            with self.assertRaises(ValueError):
+                DailySuccess('2026-10-14', path)
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ import os
 import requests
 from util.aes_help import  encrypt_data, decrypt_data
 import util.zepp_helper as zeppHelper
+from util.daily_success import DailySuccess
 
 # 获取默认值转int
 def get_int_value_default(_config: dict, _key, default):
@@ -193,14 +194,20 @@ class MiMotionRunner:
     def login_and_post_step(self, min_step, max_step):
         if self.invalid:
             return "账号或密码配置有误", False
-        app_token = self.login()
-        if app_token is None:
-            return "登陆失败！", False
+        with daily_success.account_lock(self.user):
+            completed_step = daily_success.get_step(self.user)
+            if completed_step is not None:
+                return f"今日已成功上传{completed_step}步，跳过重复修改", True
+            app_token = self.login()
+            if app_token is None:
+                return "登陆失败！", False
 
-        step = str(random.randint(min_step, max_step))
-        self.log_str += f"已设置为随机步数范围({min_step}~{max_step}) 随机值:{step}\n"
-        ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id)
-        return f"修改步数（{step}）[" + msg + "]", ok
+            step = str(random.randint(min_step, max_step))
+            self.log_str += f"已设置为随机步数范围({min_step}~{max_step}) 随机值:{step}\n"
+            ok, msg = zeppHelper.post_fake_brand_data(step, app_token, self.user_id)
+            if ok:
+                daily_success.record(self.user, step)
+            return f"修改步数（{step}）[" + msg + "]", ok
 
 
 # 启动主函数
@@ -248,6 +255,9 @@ def run_single_account(total, idx, user_mi, passwd_mi):
 
 
 def execute():
+    if daily_success.completed:
+        print("北京时间今日已成功完成，跳过登录和步数修改")
+        return True
     user_list = users.split('#')
     passwd_list = passwords.split('#')
     exec_results = []
@@ -275,6 +285,8 @@ def execute():
                 success_count += 1
         summary = f"\n执行账号总数{total}，成功：{success_count}，失败：{total - success_count}"
         print(summary)
+        if success_count == total:
+            daily_success.mark_completed()
         push_to_push_plus(push_results, summary)
         return success_count == total
     else:
@@ -309,6 +321,7 @@ def persist_user_tokens():
 if __name__ == "__main__":
     # 北京时间
     time_bj = get_beijing_time()
+    daily_success = DailySuccess(time_bj.strftime('%Y-%m-%d'))
     encrypt_support = False
     user_tokens = dict()
     if os.environ.__contains__("AES_KEY") is True:
